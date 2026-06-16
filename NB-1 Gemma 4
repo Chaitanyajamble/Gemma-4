@@ -1,0 +1,174 @@
+
+# ─────────────────────────────────────────
+# IMPORTS
+# ─────────────────────────────────────────
+import os
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, classification_report
+
+warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────
+# LOAD DATA 
+# ─────────────────────────────────────────
+print("=" * 65)
+print(" Gemma 4 Hackathon — ACP")
+print("=" * 65)
+
+POSSIBLE_PATHS = [
+    "/kaggle/input/datasets/chaitanyajamble/gemma4-mutimodel-benchmark/gemma4_multimodal_benchmark.csv",
+    "/kaggle/input/gemma4-multimodal-benchmark/gemma4_multimodal_benchmark.csv",
+    "gemma4_multimodal_benchmark.csv"
+]
+
+df = None
+for path in POSSIBLE_PATHS:
+    if os.path.exists(path):
+        df = pd.read_csv(path)
+        print(f"✓ Loaded dataset from: {path}")
+        break
+
+if df is None:
+    print("[WARNING] Dataset not found. Using synthetic fallback.")
+    np.random.seed(42)
+    n = 10000
+    df = pd.DataFrame({
+        "sample_id": [f"s_{i}" for i in range(n)],
+        "language": np.random.choice(['en','fr','de','es','ja'], n),
+        "modality": np.random.choice(['text_only','image+text','audio+text','multimodal'], n),
+        "task_type": np.random.choice(['visual_reasoning','multilingual_qa','code_generation','math_reasoning','commonsense_inference'], n),
+        "difficulty": np.random.choice(['easy','medium','hard','expert'], n),
+        "model_variant": np.random.choice(['gemma4-2b','gemma4-9b','gemma4-27b','gemma4-27b-it'], n),
+        "domain": np.random.choice(['science','medicine','law','technology'], n),
+        "context_length": np.random.randint(50, 8192, n),
+        "num_images": np.random.randint(0, 4, n),
+        "prompt_tokens": np.random.randint(20, 2048, n),
+        "completion_tokens": np.random.randint(10, 1024, n),
+        "accuracy_score": np.clip(np.random.normal(0.72, 0.12, n), 0, 1),
+        "confidence_score": np.clip(np.random.normal(0.70, 0.13, n), 0, 1),
+        "fluency_score": np.clip(np.random.normal(0.75, 0.10, n), 0, 1),
+        "factuality_score": np.clip(np.random.normal(0.68, 0.12, n), 0, 1),
+        "latency_ms": np.random.randint(80, 1200, n),
+        "is_correct": np.random.choice([0,1], n, p=[0.28,0.72]),
+        "temperature": np.random.choice([0.0,0.3,0.7,1.0], n),
+        "top_p": np.random.choice([0.8,0.9,0.95,1.0], n),
+        "used_tool_call": np.random.choice([0,1], n),
+        "required_multimodal_fusion": np.random.choice([0,1], n),
+    })
+
+print(f"Rows: {len(df)}")
+
+# ─────────────────────────────────────────
+# FEATURE ENGINEERING
+# ─────────────────────────────────────────
+df["composite_quality"] = (
+    0.35*df["accuracy_score"] +
+    0.25*df["confidence_score"] +
+    0.20*df["fluency_score"] +
+    0.20*df["factuality_score"]
+)
+
+df["quality_per_latency"] = df["composite_quality"] / (df["latency_ms"] + 1) * 1000
+df["token_density"] = df["completion_tokens"] / (df["prompt_tokens"] + 1)
+df["image_heavy"] = (df["num_images"] >= 2).astype(int)
+
+# Capability manifold
+cap_manifold = (
+    df.groupby(["model_variant","task_type"])["accuracy_score"]
+    .mean()
+    .unstack(fill_value=0.5)
+)
+
+df["manifold_score"] = df.apply(
+    lambda r: cap_manifold.loc[r["model_variant"], r["task_type"]],
+    axis=1
+)
+
+# ─────────────────────────────────────────
+# ENCODING
+# ─────────────────────────────────────────
+cat_cols = ["language","modality","task_type","difficulty","model_variant","domain"]
+
+for col in cat_cols:
+    df[col] = LabelEncoder().fit_transform(df[col])
+
+# ─────────────────────────────────────────
+# FEATURES
+# ─────────────────────────────────────────
+FEATURES = [
+    "language","modality","task_type","difficulty","model_variant","domain",
+    "context_length","num_images","prompt_tokens","completion_tokens",
+    "temperature","top_p",
+    "composite_quality","quality_per_latency","token_density",
+    "image_heavy","manifold_score",
+    "used_tool_call","required_multimodal_fusion"
+]
+
+X = df[FEATURES]
+y = df["is_correct"]
+
+# ─────────────────────────────────────────
+# SPLIT
+# ─────────────────────────────────────────
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+scaler = StandardScaler()
+X_train_sc = scaler.fit_transform(X_train)
+X_test_sc = scaler.transform(X_test)
+
+# ─────────────────────────────────────────
+#  MODELS
+# ─────────────────────────────────────────
+gbt = GradientBoostingClassifier(n_estimators=200, max_depth=5)
+rf = RandomForestClassifier(n_estimators=150, max_depth=8)
+lr = LogisticRegression(max_iter=500)
+
+gbt.fit(X_train, y_train)
+rf.fit(X_train, y_train)
+lr.fit(X_train_sc, y_train)
+
+# ─────────────────────────────────────────
+# ENSEMBLE
+# ─────────────────────────────────────────
+p1 = gbt.predict_proba(X_test)[:,1]
+p2 = rf.predict_proba(X_test)[:,1]
+p3 = lr.predict_proba(X_test_sc)[:,1]
+
+ensemble = 0.5*p1 + 0.35*p2 + 0.15*p3
+y_pred = (ensemble > 0.5).astype(int)
+
+# ─────────────────────────────────────────
+#  EVALUATION
+# ─────────────────────────────────────────
+print("\nRESULTS")
+print("Accuracy:", accuracy_score(y_test, y_pred))
+print("F1:", f1_score(y_test, y_pred))
+print("AUC:", roc_auc_score(y_test, ensemble))
+
+print("\nClassification Report:\n")
+print(classification_report(y_test, y_pred))
+
+# ─────────────────────────────────────────
+# SAVE
+# ─────────────────────────────────────────
+submission = pd.DataFrame({
+    "sample_id": df.iloc[X_test.index]["sample_id"],
+    "predicted_correct": y_pred,
+    "probability": ensemble
+})
+
+submission.to_csv("submission.csv", index=False)
+print("\nSaved submission.csv")
